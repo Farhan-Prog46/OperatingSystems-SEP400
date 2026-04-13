@@ -25,6 +25,13 @@ void* udpReadThread(void* arg)
     pthread_exit(NULL);
 }
 
+void* udpWriteThread(void* arg)
+{
+    DataAcquisition* unit = (DataAcquisition*)arg;
+    unit->writeToSubscribers();
+    pthread_exit(NULL);
+}
+
 DataAcquisition::DataAcquisition()
 {
     is_running = false;
@@ -36,6 +43,7 @@ DataAcquisition::DataAcquisition()
 
     pthread_mutex_init(&queueMutex, NULL);
     pthread_mutex_init(&subscriberMutex, NULL);
+    pthread_mutex_init(&rogueMutex, NULL);
 
     DataAcquisition::instance = this;
 }
@@ -44,6 +52,7 @@ DataAcquisition::~DataAcquisition()
 {
     pthread_mutex_destroy(&queueMutex);
     pthread_mutex_destroy(&subscriberMutex);
+    pthread_mutex_destroy(&rogueMutex);
 }
 
 void DataAcquisition::shutdown()
@@ -90,8 +99,7 @@ void DataAcquisition::addSubscriber(const string& username, const sockaddr_in& c
 
     subscribers.push_back(sub);
 
-    cout << "username:" << username
-         << " Subscribed!!" << endl;
+    cout << "username:" << username << " Subscribed!!" << endl;
 }
 
 void DataAcquisition::removeSubscriber(const string& username)
@@ -103,6 +111,42 @@ void DataAcquisition::removeSubscriber(const string& username)
             return;
         }
     }
+}
+
+bool DataAcquisition::isRogueIP(const string& ipAddress)
+{
+    for (size_t i = 0; i < rogueIPs.size(); i++) {
+        if (rogueIPs[i] == ipAddress) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DataAcquisition::addRogueIP(const string& ipAddress)
+{
+    if (!isRogueIP(ipAddress)) {
+        rogueIPs.push_back(ipAddress);
+        cout << "ROGUE CLIENT DETECTED: " << ipAddress << endl;
+    }
+}
+
+void DataAcquisition::recordIncomingIP(const string& ipAddress)
+{
+    pthread_mutex_lock(&rogueMutex);
+
+    lastThreeIPs.push_back(ipAddress);
+    if (lastThreeIPs.size() > 3) {
+        lastThreeIPs.erase(lastThreeIPs.begin());
+    }
+
+    if (lastThreeIPs.size() == 3 &&
+        lastThreeIPs[0] == lastThreeIPs[1] &&
+        lastThreeIPs[1] == lastThreeIPs[2]) {
+        addRogueIP(ipAddress);
+    }
+
+    pthread_mutex_unlock(&rogueMutex);
 }
 
 void DataAcquisition::readFromSharedMemory()
@@ -154,6 +198,19 @@ void DataAcquisition::readFromUDP()
             continue;
         }
 
+        string clientIP = inet_ntoa(clientAddr.sin_addr);
+
+        recordIncomingIP(clientIP);
+
+        pthread_mutex_lock(&rogueMutex);
+        bool rogue = isRogueIP(clientIP);
+        pthread_mutex_unlock(&rogueMutex);
+
+        if (rogue) {
+            cout << "Ignoring packet from rogue client " << clientIP << endl;
+            continue;
+        }
+
         buf[len] = '\0';
         string message(buf);
 
@@ -177,7 +234,7 @@ void DataAcquisition::readFromUDP()
                 pthread_mutex_unlock(&subscriberMutex);
             } else {
                 cout << "Bad password from "
-                     << inet_ntoa(clientAddr.sin_addr) << ":"
+                     << clientIP << ":"
                      << ntohs(clientAddr.sin_port) << endl;
             }
         }
@@ -191,6 +248,51 @@ void DataAcquisition::readFromUDP()
         else {
             cout << "unknown command " << message << endl;
         }
+    }
+}
+
+void DataAcquisition::writeToSubscribers()
+{
+    while (is_running) {
+        while (true) {
+            DataPacket packet;
+            bool hasPacket = false;
+
+            pthread_mutex_lock(&queueMutex);
+            if (!dataQueue.empty()) {
+                packet = dataQueue.front();
+                dataQueue.pop();
+                hasPacket = true;
+            }
+            pthread_mutex_unlock(&queueMutex);
+
+            if (!hasPacket) {
+                break;
+            }
+
+            unsigned char sendBuffer[2 + 1 + BUF_LEN];
+            memset(sendBuffer, 0, sizeof(sendBuffer));
+
+            unsigned short packetNoNet = htons(packet.packetNo);
+            memcpy(sendBuffer, &packetNoNet, 2);
+
+            sendBuffer[2] = (unsigned char)packet.packetLen;
+
+            memcpy(sendBuffer + 3, packet.data, packet.packetLen);
+
+            pthread_mutex_lock(&subscriberMutex);
+            for (size_t i = 0; i < subscribers.size(); i++) {
+                sendto(fd,
+                       sendBuffer,
+                       3 + packet.packetLen,
+                       0,
+                       (sockaddr*)&subscribers[i].addr,
+                       sizeof(subscribers[i].addr));
+            }
+            pthread_mutex_unlock(&subscriberMutex);
+        }
+
+        sleep(1);
     }
 }
 
@@ -253,6 +355,7 @@ int DataAcquisition::run()
 
     pthread_t shmThread;
     pthread_t readThread;
+    pthread_t writeThread;
 
     if (pthread_create(&shmThread, NULL, sharedMemoryReadThread, this) != 0) {
         cout << "Cannot create shared memory read thread" << endl;
@@ -266,8 +369,15 @@ int DataAcquisition::run()
         return -1;
     }
 
+    if (pthread_create(&writeThread, NULL, udpWriteThread, this) != 0) {
+        cout << "Cannot create UDP write thread" << endl;
+        cout << strerror(errno) << endl;
+        return -1;
+    }
+
     pthread_join(shmThread, NULL);
     pthread_join(readThread, NULL);
+    pthread_join(writeThread, NULL);
 
     if (fd >= 0) close(fd);
     sem_close(sem_id1);

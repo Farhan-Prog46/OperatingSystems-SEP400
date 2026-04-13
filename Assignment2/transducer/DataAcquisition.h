@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <algorithm>
 #include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
@@ -25,6 +26,7 @@
 static void interruptHandler(int signum);
 void* sharedMemoryReadThread(void* arg);
 void* udpReadThread(void* arg);
+void* udpWriteThread(void* arg);
 
 struct DataPacket {
     unsigned short packetNo;
@@ -53,9 +55,12 @@ class DataAcquisition {
 public:
     std::queue<DataPacket> dataQueue;
     std::vector<Subscriber> subscribers;
+    std::vector<std::string> rogueIPs;
+    std::vector<std::string> lastThreeIPs;
 
     pthread_mutex_t queueMutex;
     pthread_mutex_t subscriberMutex;
+    pthread_mutex_t rogueMutex;
 
     DataAcquisition();
     ~DataAcquisition();
@@ -65,11 +70,16 @@ public:
 
     void readFromSharedMemory();
     void readFromUDP();
+    void writeToSubscribers();
 
     bool subscriberExists(const std::string& username);
     void addSubscriber(const std::string& username, const sockaddr_in& clientAddr);
     void removeSubscriber(const std::string& username);
     std::vector<std::string> split(const std::string& text, char delimiter);
+
+    bool isRogueIP(const std::string& ipAddress);
+    void recordIncomingIP(const std::string& ipAddress);
+    void addRogueIP(const std::string& ipAddress);
 
     static DataAcquisition* instance;
 };
